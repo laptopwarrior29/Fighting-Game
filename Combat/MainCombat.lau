@@ -1,1 +1,421 @@
 
+local module = {}
+
+--Services
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local Debris = game:GetService("Debris")
+local Players = game:GetService("Players")
+local StarterPlayer = game:GetService("StarterPlayer")
+local PhysicsService = game:GetService("PhysicsService")
+
+
+--Folders
+local Events = ReplicatedStorage.Events
+local StuffFolder = ServerStorage.Stuff
+local CombatFolder = ServerStorage.Combat
+local AnimationsFolder = ReplicatedStorage.Animations
+local CharAnimsFolder = AnimationsFolder.Characters
+
+--Events
+local ValueEvent = Events.Value
+
+
+--Modules
+local CombatModule = require(CombatFolder.CombatModule)
+local CharStatsModule = require(CombatFolder.CharacterStats)
+local HitModule = require(CombatFolder.Hit)
+local OthersModule = require(StuffFolder.Others)
+local movementManager = require(ReplicatedStorage.Modules.MovementManager)
+
+
+--Collision Group
+local NO_COLLIDE_GROUP = "NoCharacterCollision"
+
+
+-- Variables
+local HitboxSize 				= Vector3.new(6, 8, 5)
+local HitboxTime 				= 0.25
+local ComboResetTime 	= 1
+local Cooldown 				= 0.1
+local HitCooldown			= 0.12
+
+--------------------------------------------------------------------------------------------------------------------------
+
+-- shared across every hitbox so two simultaneous attackers can't double-register on the same target
+local recentHits = {}
+
+local function canRegisterHit(attacker, target)
+	local now = tick()
+	local atkTable = recentHits[attacker]
+	if not atkTable then
+		atkTable = {}
+		recentHits[attacker] = atkTable
+	end
+
+	for tgt, t in pairs(atkTable) do
+		if now - t > 1 then atkTable[tgt] = nil end
+	end
+
+	local last = atkTable[target] or 0
+	if now - last < HitCooldown then return false end
+
+	atkTable[target] = now
+	return true
+end
+
+Players.PlayerRemoving:Connect(function(plr)
+	if plr.Character then
+		recentHits[plr.Character] = nil
+	end
+end)
+
+-- Checks 
+local function getHumanoid(char)
+	return char and char:FindFirstChild("Humanoid")
+end
+
+
+local function getRoot(char)
+	return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+
+--------------------------------------------------------------------------------------------------------------------------
+
+--Functions 
+local function createHitbox(root)
+	local hitbox          = Instance.new("Part")
+	hitbox.Size           = HitboxSize
+	hitbox.Transparency   = 0.7
+	hitbox.Color          = Color3.fromRGB(255, 0, 0)
+	hitbox.CFrame         = root.CFrame * CFrame.new(0, -1, -7)
+	hitbox.CanCollide     = false
+	hitbox.Anchored       = false
+	hitbox.Massless       = true
+	hitbox.Parent         = workspace
+
+	local weld        = Instance.new("Weld")
+	weld.Part0        = root
+	weld.Part1        = hitbox
+	weld.C1           = CFrame.new(0, 0, 3.5)
+	weld.Parent       = hitbox
+
+	Debris:AddItem(hitbox, HitboxTime)
+	return hitbox
+end
+
+local function restoreOnStopped(char, humanoid)
+	task.wait(0.15)
+	if char:GetAttribute("Punch") or char:GetAttribute("IsBlocking") then return end
+	humanoid.WalkSpeed = StarterPlayer.CharacterWalkSpeed
+	humanoid.JumpHeight = StarterPlayer.CharacterJumpHeight
+end
+
+--------------------------------------------------------------------------------------------------------------------------
+
+-- Module Functions 
+
+
+-- M1s
+
+
+function module.Attack(char)
+	if not char then return end
+	local player = Players:GetPlayerFromCharacter(char)
+	local humanoid = getHumanoid(char)
+	local root = getRoot(char)
+	
+	if not humanoid or not root then return end
+	if OthersModule.CheckForAttributes(char, true, true, true, true, nil, true, true, true) then return end
+	local class = char:GetAttribute("Class")
+	if not class then return end
+	
+	local ultAttribute = char:GetAttribute("UltMode")
+	local classStats = CharStatsModule.getStats(class)
+	local damage = classStats.Damage
+	
+	char:SetAttribute("Attacking", true)
+	char:SetAttribute("Punch", true)
+	CombatModule.ChangeCombo(char)
+	CombatModule.stopAnims(humanoid)
+	
+	humanoid.WalkSpeed = 0
+	humanoid.JumpHeight = 0
+	
+	if class == "GentleMan" then
+		print("Firing HamonVFX to client")
+		ValueEvent:FireClient(player, "HamonVFX")
+	end
+
+	if ultAttribute == true then
+		local anim = CombatModule.getUltM1Anim(char, class)
+		local track = humanoid:LoadAnimation(anim)
+		local hitAnim = CharAnimsFolder[class].Hit["Hit" .. char:GetAttribute("Combo")]
+
+		track:GetMarkerReachedSignal("Start"):Connect(function()
+			local hitbox = createHitbox(root)
+			local hitOnce = {}
+			hitbox.Touched:Connect(function(hit)
+				local targetChar = hit.Parent
+				local targetHum = targetChar and targetChar:FindFirstChild("Humanoid")
+				if targetHum and targetChar ~= char and not hitOnce[targetChar] then
+					if targetChar:GetAttribute("IsRagdoll") then return end
+					if not canRegisterHit(char, targetChar) then return end
+					hitOnce[targetChar] = true
+					HitModule.Normal_HitboxHit(char, targetHum, class, hitbox, hit, hitAnim)
+					if player then ValueEvent:FireClient(player, damage) end
+					if not targetChar:GetAttribute("IsBlocking") then
+						if player then HitModule.BodyVelocity(root, root, 8, 0.1) end
+					end
+				end
+			end)
+		end)
+
+		track:GetMarkerReachedSignal("End"):Connect(function()
+			char:SetAttribute("Punch", false)
+			char:SetAttribute("Attacking", true)
+			if char:GetAttribute("Combo") == 4 then
+				task.wait(ComboResetTime)
+			else
+				task.wait(Cooldown)
+			end
+			char:SetAttribute("Attacking", false)
+		end)
+
+		track.Stopped:Connect(function()
+			task.wait(0.1)
+			if not char:GetAttribute("Punch") and not char:GetAttribute("IsBlocking") then
+				humanoid.WalkSpeed = StarterPlayer.CharacterWalkSpeed
+				humanoid.JumpHeight = StarterPlayer.CharacterJumpHeight
+			end
+		end)
+
+		track:Play()
+	else
+		local anim = CombatModule.getM1Anim(char, class)
+		local track = humanoid:LoadAnimation(anim)
+		local hitAnim = CharAnimsFolder[class].Hit["Hit" .. char:GetAttribute("Combo")]
+
+		track:GetMarkerReachedSignal("Start"):Connect(function()
+			if class == "GentleMan" then
+				ValueEvent:FireClient(player, "HamonVFX")
+			end
+
+			local hitbox = createHitbox(root)
+			local hitOnce = {}
+			hitbox.Touched:Connect(function(hit)
+				local targetChar = hit.Parent
+				local targetHum = targetChar and targetChar:FindFirstChild("Humanoid")
+				if targetHum and targetChar ~= char and not hitOnce[targetChar] then
+					if targetChar:GetAttribute("IsRagdoll") then return end
+					if not canRegisterHit(char, targetChar) then return end
+					hitOnce[targetChar] = true
+					HitModule.Normal_HitboxHit(char, targetHum, class, hitbox, hit, hitAnim)
+					if player then ValueEvent:FireClient(player, damage) end
+					if not targetChar:GetAttribute("IsBlocking") then
+						if player then HitModule.BodyVelocity(root, root, 8, 0.1) end
+					end
+				end
+			end)
+		end)
+
+		track:GetMarkerReachedSignal("End"):Connect(function()
+			char:SetAttribute("Punch", false)
+			char:SetAttribute("Attacking", true)
+			if char:GetAttribute("Combo") == 4 then
+				task.wait(ComboResetTime)
+			else
+				task.wait(Cooldown)
+			end
+			char:SetAttribute("Attacking", false)
+		end)
+
+		track.Stopped:Connect(function()
+			restoreOnStopped(char, humanoid)
+		end)
+
+		track:Play()
+	end
+end
+
+--Down Slam
+function module.DownSlam(char)
+	if not char then return end
+
+	local player   = Players:GetPlayerFromCharacter(char)
+	local humanoid = char:FindFirstChild("Humanoid")
+	local root     = char:FindFirstChild("HumanoidRootPart")
+	local torso    = char:FindFirstChild("Torso")
+
+	if not (humanoid and root and torso) then return end
+	if OthersModule.CheckForAttributes(char, true, true, true, true, nil, true, true, nil) then return end
+
+	local class  = char:GetAttribute("Class")
+	local stats  = CharStatsModule.getStats(class)
+	local damage = stats.Damage
+
+	char:SetAttribute("Attacking", true)
+	char:SetAttribute("Punch", true)
+
+	CombatModule.ChangeCombo(char)
+	CombatModule.stopAnims(humanoid)
+
+	humanoid.WalkSpeed  = 0
+	humanoid.JumpHeight = 0
+
+	local originalGroups = {}
+
+	local function setNoCollide(part)
+		if not part or not part:IsA("BasePart") then return end
+		originalGroups[part] = part.CollisionGroup or "Default"
+		part.CollisionGroup = NO_COLLIDE_GROUP
+	end
+
+	setNoCollide(torso)
+	setNoCollide(char:FindFirstChild("Left Leg"))
+	setNoCollide(char:FindFirstChild("Right Leg"))
+	setNoCollide(char:FindFirstChild("Right Arm"))
+	setNoCollide(char:FindFirstChild("Left Arm"))
+	setNoCollide(root) 
+
+	local anim    	 		= CombatModule.getDownSlamAnim(char, class)
+	local track    			= humanoid:LoadAnimation(anim)
+	local hitAnim  		= CharAnimsFolder[class].Hit.Hit4
+
+	local hitbox, weld
+
+	track:GetMarkerReachedSignal("Start"):Connect(function()
+		hitbox 							= Instance.new("Part")
+		hitbox.Size         			= HitboxSize
+		hitbox.Transparency 	= 0.7
+		hitbox.Color        		= Color3.fromRGB(255, 0, 0)
+		hitbox.CFrame       	= root.CFrame * CFrame.new(0, -1, -7)
+		hitbox.CanCollide   	= false
+		hitbox.Anchored     	= false
+		hitbox.Massless     	= true
+		hitbox.Parent       		= workspace
+
+		weld 							= Instance.new("Weld")
+		weld.Part0 					= root
+		weld.Part1 					= hitbox
+		weld.C1    					= CFrame.new(0, 0, 3.5)
+		weld.Parent 				= hitbox
+
+		Debris:AddItem(hitbox, HitboxTime)
+
+		task.delay(0.08, function()
+			if root and root.Parent then
+				local linVel = root.AssemblyLinearVelocity
+				local angVel = root.AssemblyAngularVelocity
+
+				if linVel.Magnitude > 70 or angVel.Magnitude > 35 then
+					root.AssemblyLinearVelocity  = Vector3.new(linVel.X * 0.15, linVel.Y, linVel.Z * 0.15)
+					root.AssemblyAngularVelocity = Vector3.new()
+				end
+			end
+		end)
+
+		local hitOnce = {}
+		hitbox.Touched:Connect(function(hit)
+			local targetChar = hit.Parent
+			local targetHum  = targetChar and targetChar:FindFirstChild("Humanoid")
+
+			if targetHum and targetChar ~= char and not hitOnce[targetChar] then
+				if not canRegisterHit(char, targetChar) then return end
+				hitOnce[targetChar] = true
+				HitModule.DownSlam_Hitbox(char, targetHum, class, hitbox, hit, hitAnim)
+				ValueEvent:FireClient(player, damage)
+			end
+		end)
+	end)
+
+	track:GetMarkerReachedSignal("End"):Connect(function()
+		char:SetAttribute("Punch", false)
+		char:SetAttribute("Attacking", true)
+		task.wait(ComboResetTime)
+		char:SetAttribute("Attacking", false)
+	end)
+
+	track.Stopped:Connect(function()
+		for part, group in pairs(originalGroups) do
+			if part and part.Parent then
+				part.CollisionGroup = group
+			end
+		end
+
+		if not char:GetAttribute("IsBlocking") then
+			restoreOnStopped(char, humanoid)
+		end
+	end)
+
+	track:Play()
+end
+
+function module.FrontDash(char)
+	if not char then return end
+
+	local player   		= Players:GetPlayerFromCharacter(char)
+	local humanoid 	= char:FindFirstChild("Humanoid")
+	local root     			= char:FindFirstChild("HumanoidRootPart")
+
+	if not (humanoid and root) then return end
+	if OthersModule.CheckForAttributes(char, true, true, true, true, nil, true, true, true) then return end
+
+	local class       		= char:GetAttribute("Class")
+	local classStats     = CharStatsModule.getStats(class)
+	local damage      	= classStats.Damage
+
+	char:SetAttribute("Attacking", 	true)
+	char:SetAttribute("Punch", 		true)
+
+	CombatModule.stopAnims(humanoid)
+
+	humanoid.WalkSpeed  = 0
+	humanoid.JumpHeight = 0
+
+
+	local anim       	= CombatModule.getQHitAnim(char, class)
+	local track      	= humanoid:LoadAnimation(anim)
+	local hitAnim    = CharAnimsFolder[class].Hit.Hit1
+
+	track:GetMarkerReachedSignal("Start"):Connect(function()
+		local hitbox 		= createHitbox(root)
+		local hitOnce 	= {}
+
+		hitbox.Touched:Connect(function(hit)
+			local targetChar 	= hit.Parent
+			local targetHum  	= targetChar and targetChar:FindFirstChild("Humanoid")
+
+			if targetHum and targetChar ~= char and not hitOnce[targetChar] then
+				if targetChar:GetAttribute("IsBlocking") then return end
+				if targetChar:GetAttribute("IsRagdoll") then return end
+				if not canRegisterHit(char, targetChar) then return end
+				hitOnce[targetChar] = true
+				HitModule.FrontDash_Hitbox(char, targetHum, class, hitbox, hit, hitAnim)
+				if player then ValueEvent:FireClient(player, damage) end
+			end
+		end)
+	end)
+
+	track:GetMarkerReachedSignal("End"):Connect(function()
+		char:SetAttribute("Punch", 		false)
+		char:SetAttribute("Attacking", 	true)
+		CombatModule.SetComboTo(char, 1)
+		task.wait(Cooldown)
+		char:SetAttribute("Attacking", 	false)
+	end)
+
+	track.Stopped:Connect(function()
+		restoreOnStopped(char, humanoid)
+	end)
+
+	track:Play()
+end
+
+
+return module
+
+
+
+
